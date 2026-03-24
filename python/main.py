@@ -95,14 +95,28 @@ def run_hull(args: argparse.Namespace) -> None:
         - Import graph_diameter from consensus.graph_utils.
         - Print which round convergence was detected.
     """
-    # TODO: load scenario
-    # TODO: num_rounds = args.rounds if args.rounds else graph_diameter(adjacency)
-    # TODO: history = run_convex_hull_consensus(positions, adjacency, num_rounds)
-    # TODO: converged, k = did_hulls_converge(history)
-    # TODO: print(f"Converged: {converged} at round {k}")
-    # TODO: fig = draw_hull_convergence_summary(history, positions)
-    # TODO: plt.show()
-    raise NotImplementedError
+    from simulation.scenario import create_default_scenario
+    from consensus.graph_utils import graph_diameter
+    from consensus.convex_hull import run_convex_hull_consensus, did_hulls_converge
+    from plotting.draw_hulls import draw_hull_convergence_summary
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    scenario  = create_default_scenario()
+    agents    = scenario['agents']
+    adjacency = scenario['adjacency']
+
+    positions = np.array([a.position for a in agents])
+
+    num_rounds = args.rounds if args.rounds else graph_diameter(adjacency)
+
+    history = run_convex_hull_consensus(positions, adjacency, num_rounds)
+    converged, k = did_hulls_converge(history)
+    print(f"Rounds run : {num_rounds}")
+    print(f"Converged  : {converged} at round {k}")
+
+    fig = draw_hull_convergence_summary(history, positions, adjacency=adjacency)
+    plt.show()
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +126,53 @@ def run_hull(args: argparse.Namespace) -> None:
 def run_direction(args: argparse.Namespace) -> None:
     """Phase 2: preferred direction of motion consensus.
 
-    What this mode will show:
+    What this mode shows:
         - Robot positions and obstacles.
-        - Hull centroid and goal direction.
-        - Per-robot utility bars over candidate angles.
-        - The agreed team direction θ* drawn as an arrow from the centroid.
+        - All candidate directions as arrows from the hull centroid,
+          coloured red (blocked) to green (clear) by global utility.
+        - The agreed team direction θ* as a bold black arrow.
     """
-    # TODO: implement in Phase 2
-    raise NotImplementedError
+    from simulation.scenario import create_default_scenario
+    from consensus.graph_utils import graph_diameter
+    from consensus.convex_hull import run_convex_hull_consensus
+    from consensus.preferred_direction import (
+        run_direction_consensus, select_preferred_direction
+    )
+    from plotting.draw_team import draw_direction_result
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    scenario  = create_default_scenario()
+    agents    = scenario['agents']
+    adjacency = scenario['adjacency']
+    obstacles = scenario['obstacles']
+
+    positions  = np.array([a.position for a in agents])
+    num_rounds = args.rounds if args.rounds else graph_diameter(adjacency)
+
+    # Phase 1 result: hull centroid is the arrow origin
+    hull_history = run_convex_hull_consensus(positions, adjacency, num_rounds)
+    hull_vertices = hull_history[-1][0]          # all robots agree after d rounds
+    centroid = hull_vertices.mean(axis=0)
+
+    # 16 candidate angles evenly spaced around the full circle
+    candidate_angles = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+
+    _, final_utilities = run_direction_consensus(
+        positions, adjacency, obstacles, candidate_angles, num_rounds
+    )
+
+    # All rows of final_utilities are identical after consensus — use robot 0's
+    theta_star = select_preferred_direction(final_utilities[0], candidate_angles)
+
+    print(f"Rounds run : {num_rounds}")
+    print(f"θ*         : {np.degrees(theta_star):.1f}°")
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    draw_direction_result(ax, agents, obstacles, centroid,
+                          candidate_angles, final_utilities[0], theta_star)
+    plt.tight_layout()
+    plt.show()
 
 
 def run_local_free_space(args: argparse.Namespace) -> None:

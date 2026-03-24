@@ -10,6 +10,7 @@ Used by:
 """
 
 import numpy as np
+from scipy.spatial import ConvexHull, QhullError
 
 
 def compute_convex_hull(points: np.ndarray) -> np.ndarray:
@@ -31,13 +32,21 @@ def compute_convex_hull(points: np.ndarray) -> np.ndarray:
         - scipy.spatial.ConvexHull raises QhullError for degenerate inputs;
           catch it and fall back to the collinear case.
     """
-    # TODO: handle N == 1 edge case
-    # TODO: handle N == 2 edge case
-    # TODO: try scipy.spatial.ConvexHull(points)
-    # TODO: on QhullError (collinear), find and return the two extreme indices
-    # TODO: return hull.vertices in CCW order for the normal case
-    raise NotImplementedError
 
+    N = points.shape[0]
+
+    if N == 1:
+        return np.array([0])
+    if N ==2:
+        return np.array([0,1])
+    try:
+        hull = ConvexHull(points)
+        return hull.vertices
+    except QhullError:
+        diffs = points[:,np.newaxis,:] - points[np.newaxis,:,:]
+        dists = np.linalg.norm(diffs,axis=2)
+        i,j = np.unravel_index(np.argmax(dists),dists.shape)
+        return np.array([i,j])
 
 def extract_hull_vertices(points: np.ndarray) -> np.ndarray:
     """Return the convex hull vertex coordinates for a set of 2D points.
@@ -54,6 +63,5 @@ def extract_hull_vertices(points: np.ndarray) -> np.ndarray:
           into points.
         - The returned array is a new array (a copy), not a view.
     """
-    # TODO: call compute_convex_hull(points) to get indices
-    # TODO: return points[indices].copy()
-    raise NotImplementedError
+    indices = compute_convex_hull(points)
+    return points[indices].copy()

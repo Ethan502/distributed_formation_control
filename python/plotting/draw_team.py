@@ -109,6 +109,88 @@ def draw_team_state(
     ax.set_title(f"{n} robots, {n_edges} edges")
 
 
+def draw_direction_result(
+    ax: Axes,
+    agents: list[Agent],
+    obstacles: list[Rectangle],
+    centroid: np.ndarray,
+    candidate_angles: np.ndarray,
+    final_utility: np.ndarray,
+    theta_star: float,
+    max_range: float = 20.0,
+) -> None:
+    """Draw the outcome of the direction consensus (Phase 2).
+
+    Shows:
+        1. Obstacles and robot positions.
+        2. All candidate directions as arrows from the hull centroid,
+           colored by global utility (red = blocked, green = clear).
+        3. The chosen direction theta_star as a bold black arrow.
+        4. The hull centroid as a large dot.
+
+    Args:
+        ax:               Matplotlib Axes.
+        agents:           List of Agent objects (for robot positions).
+        obstacles:        List of Rectangle obstacles.
+        centroid:         Hull centroid, shape (2,). Arrow origin.
+        candidate_angles: Array of κ angles in radians, shape (κ,).
+        final_utility:    Global utility vector after consensus, shape (κ,).
+                          All robots share this same vector after d rounds.
+        theta_star:       The selected direction angle in radians.
+        max_range:        Used to normalise utility colours (0 → max_range).
+    """
+    import matplotlib.cm as cm
+    from matplotlib.colors import Normalize
+
+    draw_rect_obstacles(ax, obstacles)
+
+    # Robot positions
+    for agent in agents:
+        color = ROBOT_COLORS[agent.id % len(ROBOT_COLORS)]
+        ax.scatter(agent.position[0], agent.position[1],
+                   color=color, s=80, zorder=4, edgecolors='black', linewidths=0.5)
+        ax.text(agent.position[0] + 0.1, agent.position[1] + 0.1,
+                str(agent.id), fontsize=9, zorder=5)
+
+    # Candidate direction arrows — coloured by utility
+    norm = Normalize(vmin=0, vmax=max_range)
+    cmap = cm.RdYlGn
+    arrow_len = 1.2
+    for theta, utility in zip(candidate_angles, final_utility):
+        tip = centroid + arrow_len * np.array([np.cos(theta), np.sin(theta)])
+        color = cmap(norm(utility))
+        ax.annotate("", xy=tip, xytext=centroid,
+                    arrowprops=dict(arrowstyle='->', color=color, lw=1.5), zorder=3)
+
+    # Winning direction — bold black arrow, slightly longer
+    tip_star = centroid + 1.8 * np.array([np.cos(theta_star), np.sin(theta_star)])
+    ax.annotate("", xy=tip_star, xytext=centroid,
+                arrowprops=dict(arrowstyle='->', color='black', lw=3.0), zorder=5)
+
+    # Hull centroid marker
+    ax.scatter(centroid[0], centroid[1], color='black', s=60,
+               zorder=6, marker='D', label='Centroid')
+
+    # Colourbar to show utility scale
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label='Ray clearance (m)', fraction=0.03, pad=0.04)
+
+    # Set axis limits to show the full scenario (robots + obstacles) with margin
+    all_x = [a.position[0] for a in agents]
+    all_y = [a.position[1] for a in agents]
+    for obs in obstacles:
+        all_x += [obs.x_min, obs.x_max]
+        all_y += [obs.y_min, obs.y_max]
+    margin = 1.0
+    ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
+    ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+
+    ax.set_aspect('equal')
+    ax.set_title(f"Direction consensus — θ* = {np.degrees(theta_star):.1f}°")
+    ax.legend(loc='upper right', fontsize=8)
+
+
 def draw_rect_obstacles(ax: Axes, obstacles: list[Rectangle]) -> None:
     """Draw axis-aligned rectangular obstacles on the given axes.
 

@@ -19,6 +19,7 @@ def draw_local_hull_estimates(
     robot_positions: np.ndarray,
     round_idx: int,
     highlight_robot: int | None = None,
+    adjacency: np.ndarray | None = None,
 ) -> None:
     """Draw every robot's local hull estimate at a given consensus round.
 
@@ -41,22 +42,52 @@ def draw_local_hull_estimates(
         - Draw robot positions as dots on top of the filled polygons.
         - Set a title like "Round k: hull estimates".
     """
-    # TODO: retrieve estimates = hull_history[round_idx]
-    # TODO: for i, vertices in enumerate(estimates):
-    #   color = ROBOT_COLORS[i % len(ROBOT_COLORS)]
-    #   lw = 2.5 if i == highlight_robot else 1.0
-    #   if len(vertices) == 1: ax.scatter(...)
-    #   elif len(vertices) == 2: ax.plot(...)
-    #   else: draw filled polygon with alpha=0.25
-    # TODO: draw robot_positions as dots on top (zorder high)
-    # TODO: ax.set_aspect('equal')
-    # TODO: ax.set_title(f"Round {round_idx}: local hull estimates")
-    raise NotImplementedError
+    estimates = hull_history[round_idx]
+
+    for i, vertices in enumerate(estimates):
+        color = ROBOT_COLORS[i % len(ROBOT_COLORS)]
+        lw = 2.5 if i == highlight_robot else 1.0
+
+        if len(vertices) == 1:
+            ax.scatter(vertices[0, 0], vertices[0, 1], color=color, s=40, zorder=3)
+        elif len(vertices) == 2:
+            ax.plot(vertices[:, 0], vertices[:, 1], color=color, linewidth=lw, zorder=3)
+        else:
+            poly = plt.Polygon(vertices, closed=True,
+                               facecolor=color, edgecolor=color,
+                               alpha=0.25, linewidth=lw, zorder=2)
+            ax.add_patch(poly)
+
+    # Draw communication graph as directed arrows if adjacency is provided
+    if adjacency is not None:
+        N = len(robot_positions)
+        for i in range(N):
+            for j in range(N):
+                if adjacency[i, j]:
+                    ax.annotate(
+                        "",
+                        xy=robot_positions[j],
+                        xytext=robot_positions[i],
+                        arrowprops=dict(
+                            arrowstyle='->', color='dimgrey',
+                            lw=1.2, shrinkA=6, shrinkB=6,
+                        ),
+                        zorder=1,
+                    )
+
+    # Robot positions drawn on top of all hull polygons
+    for i, pos in enumerate(robot_positions):
+        color = ROBOT_COLORS[i % len(ROBOT_COLORS)]
+        ax.scatter(pos[0], pos[1], color=color, s=60, zorder=4, edgecolors='black', linewidths=0.5)
+
+    ax.set_aspect('equal')
+    ax.set_title(f"Round {round_idx}: local hull estimates")
 
 
 def draw_hull_convergence_summary(
     hull_history: list[list[np.ndarray]],
     robot_positions: np.ndarray,
+    adjacency: np.ndarray | None = None,
 ) -> plt.Figure:
     """Create a multi-panel figure showing hull estimates across all rounds.
 
@@ -79,11 +110,28 @@ def draw_hull_convergence_summary(
         - Each subplot title should indicate the round number and whether
           all robots share the same hull at that round.
     """
-    # TODO: num_rounds = len(hull_history)
-    # TODO: choose subplot grid (1 row or 2 rows depending on num_rounds)
-    # TODO: fig, axes = plt.subplots(nrows, ncols, ...)
-    # TODO: for k, ax in enumerate(axes.flat):
-    #         draw_local_hull_estimates(ax, hull_history, robot_positions, k)
-    # TODO: fig.suptitle("Convex hull consensus convergence")
-    # TODO: return fig
-    raise NotImplementedError
+    num_rounds = len(hull_history)
+
+    # Use one row for <= 5 panels, two rows otherwise
+    if num_rounds <= 5:
+        nrows, ncols = 1, num_rounds
+    else:
+        ncols = (num_rounds + 1) // 2
+        nrows = 2
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+
+    # axes may be a single Axes, a 1-D array, or a 2-D array — flatten to iterate
+    axes_flat = np.array(axes).flatten()
+
+    for k, ax in enumerate(axes_flat[:num_rounds]):
+        draw_local_hull_estimates(ax, hull_history, robot_positions, k,
+                                  adjacency=adjacency if k == 0 else None)
+
+    # Hide any unused subplot panels
+    for ax in axes_flat[num_rounds:]:
+        ax.set_visible(False)
+
+    fig.suptitle("Convex hull consensus convergence", fontsize=13)
+    fig.tight_layout()
+    return fig

@@ -56,25 +56,39 @@ def run_convex_hull_consensus(
           should handle this gracefully.
     """
     # Step 1: Validate that points has shape (N, 2) and adjacency is (N, N).
-
+    N = points.shape[0]
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(f"points must have shape (N,2), got {points.shape}")
+    if adjacency.shape != (N,N):
+        raise ValueError(f"adjacency must have shape ({N},{N}), got {adjacency.shape}")
     # Step 2: Initialize each robot's candidate point set with its own position.
-    #         candidate_points[i] = np.array([points[i]])  — shape (1, 2).
-    #         prev_hull[i]        = np.array([points[i]])  — shape (1, 2).
-    #         history[0][i]       = candidate_points[i].copy()
+    candidate_points = [np.array([points[i]]) for i in range(N)]
+    prev_hull = [np.array([points[i]]) for i in range(N)]
+    history = [[cp.copy() for cp in candidate_points]]
 
-    # Step 3: For each round k = 0 ... num_rounds-1:
-    #   a. Compute new points to broadcast for each robot i:
-    #         new_pts[i] = rows in candidate_points[i] NOT in prev_hull[i]
-    #      (for the simple version just broadcast candidate_points[i] in full)
-    #   b. For each robot i, collect new_pts[j] from every neighbor j.
-    #   c. Merge: candidate_points[i] = unique union of current + received.
-    #   d. Recompute hull vertices: candidate_points[i] = extract_hull_vertices(...)
-    #   e. Save: history[k+1][i] = candidate_points[i].copy()
-    #   f. Update prev_hull[i] = old candidate_points[i] for next round.
+    for k in range(num_rounds):
+        broadcast = [candidate_points[i].copy() for i in range(N)] #TODO: Still need to make this into the efficient version
+        new_candidate_points = []
+        for i in range(N):
+            neighbors = np.where(adjacency[i] == 1)[0]
+            received = [broadcast[j] for j in neighbors]
+            merged = np.vstack([candidate_points[i]]+received) # stack own + all received
+            new_candidate_points.append(merged)
 
-    # Step 4: Return history.
-    raise NotImplementedError
+        round_history = []
+        for i in range(N):
+            prev_hull[i] = candidate_points[i].copy()
+            candidate_points[i] = extract_hull_vertices(new_candidate_points[i])
+            round_history.append(candidate_points[i].copy())
+        history.append(round_history)
+    return history
 
+
+def sort_vertices_by_angle(verts: np.ndarray) -> np.ndarray:
+# verts: shape (K,2)
+    centroid = verts.mean(axis=0)
+    angles = np.arctan2(verts[:,1] - centroid[1], verts[:,0] - centroid[0])
+    return verts[np.argsort(angles)]
 
 def did_hulls_converge(
     history: list[list[np.ndarray]],
@@ -101,9 +115,18 @@ def did_hulls_converge(
           as a quick proxy for equality.
         - Returns (True, 0) if num_rounds=0 and there is only one robot.
     """
-    # TODO: iterate over rounds k in range(len(history))
-    # TODO: for each round, sort every robot's hull vertices by angle
-    # TODO: check if all robots' sorted vertex arrays are close to robot 0's
-    # TODO: if yes, return (True, k)
-    # TODO: if loop ends without convergence, return (False, len(history)-1)
-    raise NotImplementedError
+    for k in range(len(history)):
+        round_estimates = history[k] # List of N arrays
+        sorted_0 = sort_vertices_by_angle(round_estimates[0])
+        all_match = True
+        for i in range(1,len(round_estimates)):
+            sorted_i = sort_vertices_by_angle(round_estimates[i])
+            if sorted_i.shape != sorted_0.shape:
+                all_match = False
+                break
+            if not np.allclose(sorted_i, sorted_0):
+                all_match = False
+                break
+        if all_match:
+            return(True, k)
+    return(False, len(history)-1)
