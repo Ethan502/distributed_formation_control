@@ -49,6 +49,7 @@ class Agent:
     id: int
     position: np.ndarray            # shape (2,)
     velocity: np.ndarray            # shape (2,)
+    sensing_range: float = 3.0      # radius within which obstacles are visible
     target: np.ndarray | None = None  # shape (2,), set during Phase 6
 
     # Local consensus variables — initialized lazily in each phase

@@ -118,6 +118,7 @@ def draw_direction_result(
     final_utility: np.ndarray,
     theta_star: float,
     max_range: float = 20.0,
+    goal: np.ndarray | None = None,
 ) -> None:
     """Draw the outcome of the direction consensus (Phase 2).
 
@@ -176,12 +177,20 @@ def draw_direction_result(
     sm.set_array([])
     plt.colorbar(sm, ax=ax, label='Ray clearance (m)', fraction=0.03, pad=0.04)
 
-    # Set axis limits to show the full scenario (robots + obstacles) with margin
+    # Goal marker
+    if goal is not None:
+        ax.scatter(goal[0], goal[1], marker='*', s=250, color='gold',
+                   edgecolors='darkorange', linewidths=0.8, zorder=6, label='Goal')
+
+    # Set axis limits to show the full scenario (robots + obstacles + goal) with margin
     all_x = [a.position[0] for a in agents]
     all_y = [a.position[1] for a in agents]
     for obs in obstacles:
         all_x += [obs.x_min, obs.x_max]
         all_y += [obs.y_min, obs.y_max]
+    if goal is not None:
+        all_x.append(goal[0])
+        all_y.append(goal[1])
     margin = 1.0
     ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
     ax.set_ylim(min(all_y) - margin, max(all_y) + margin)

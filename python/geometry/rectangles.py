@@ -70,6 +70,20 @@ class Rectangle:
     def height(self) -> float:
         return self.y_max - self.y_min
 
+    def distance_to_point(self, point: np.ndarray) -> float:
+        """Return the minimum distance from point to the rectangle boundary.
+
+        Uses the nearest-point-on-rectangle approach: clamp the query point
+        to [x_min, x_max] × [y_min, y_max] and measure the distance.
+        Returns 0 if the point is inside the rectangle.
+
+        Args:
+            point: 2D point, shape (2,).
+        """
+        nearest_x = np.clip(point[0], self.x_min, self.x_max)
+        nearest_y = np.clip(point[1], self.y_min, self.y_max)
+        return float(np.linalg.norm(point - np.array([nearest_x, nearest_y])))
+
     def contains_point(self, point: np.ndarray) -> bool:
         """Return True if point is strictly inside the rectangle.
 

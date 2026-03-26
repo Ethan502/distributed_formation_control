@@ -82,10 +82,43 @@ def ray_clearance(
 
     return closest
 
-def compute_local_utilities(position: np.ndarray, obstacles: list[Rectangle],candidate_angles: np.ndarray, max_range: float=20.0) -> np.ndarray:
-    utilities = np.zeros(len(candidate_angles),)
-    for k,theta in enumerate(candidate_angles):
-        utilities[k] = ray_clearance(position,theta,obstacles,max_range)
+def compute_local_utilities(
+    position: np.ndarray,
+    obstacles: list[Rectangle],
+    candidate_angles: np.ndarray,
+    max_range: float = 20.0,
+    goal_angle: float | None = None,
+) -> np.ndarray:
+    """Compute this robot's utility value for each candidate direction.
+
+    Args:
+        position:         Robot position, shape (2,).
+        obstacles:        List of Rectangle obstacles visible to this robot.
+        candidate_angles: Array of κ angles in radians, shape (κ,).
+        max_range:        Sensing range cap passed to ray_clearance.
+        goal_angle:       If provided, multiply clearance by a goal-alignment
+                          weight so directions toward the goal are preferred.
+                          Weight is 1.0 when pointing at goal, 0.2 when pointing
+                          directly away.
+
+    Returns:
+        utilities: Array of shape (κ,).
+    """
+    utilities = np.zeros(len(candidate_angles))
+    for k, theta in enumerate(candidate_angles):
+        utilities[k] = ray_clearance(position, theta, obstacles, max_range)
+
+    if goal_angle is not None:
+        # Angular difference between each candidate and the goal direction,
+        # wrapped to [-π, π].
+        angular_diff = np.abs(np.arctan2(
+            np.sin(candidate_angles - goal_angle),
+            np.cos(candidate_angles - goal_angle),
+        ))
+        # Weight: 1.0 pointing at goal, 0.2 pointing directly away.
+        goal_weight = 0.2 + 0.8 * (1.0 - angular_diff / np.pi)
+        utilities *= goal_weight
+
     return utilities
 
 def run_direction_consensus(
@@ -94,7 +127,10 @@ def run_direction_consensus(
     obstacles: list[Rectangle],
     candidate_angles: np.ndarray,
     num_rounds: int,
-    max_range: float=20.0) -> tuple[list[list[np.ndarray]], np.ndarray]:
+    max_range: float = 20.0,
+    centroid: np.ndarray | None = None,
+    goal: np.ndarray | None = None,
+) -> tuple[list[list[np.ndarray]], np.ndarray]:
 
     """Run Algorithm 2: distributed min-consensus on utility vectors.
 
@@ -123,8 +159,26 @@ def run_direction_consensus(
         raise ValueError(f"positions must have shape (N, 2), got {positions.shape}")
     if adjacency.shape != (N, N):
         raise ValueError(f"adjacency must have shape ({N}, {N}), got {adjacency.shape}")
-    
-    utilities = [compute_local_utilities(positions[i],obstacles,candidate_angles,max_range) for i in range(N)]
+
+    # Compute goal angle from centroid → goal vector if both are provided
+    goal_angle = None
+    if centroid is not None and goal is not None:
+        diff = goal - centroid
+        goal_angle = np.arctan2(diff[1], diff[0])
+
+    # Ray clearance is computed from the hull centroid (if provided), not each
+    # robot's individual position. This asks "can the formation centroid travel
+    # in this direction?" rather than "can this individual robot travel there?"
+    # Robot 4 at y=4 would incorrectly report east as blocked (upper obstacle
+    # is in the way from its position), but the centroid at y≈2 has a clear path.
+    query_points = [centroid if centroid is not None else positions[i]
+                    for i in range(N)]
+
+    utilities = [
+        compute_local_utilities(query_points[i], obstacles, candidate_angles,
+                                max_range, goal_angle)
+        for i in range(N)
+    ]
     history = [[u.copy() for u in utilities]]
 
     for k in range(num_rounds):
