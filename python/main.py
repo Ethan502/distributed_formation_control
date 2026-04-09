@@ -1231,6 +1231,342 @@ def run_closed_loop(args: argparse.Namespace) -> None:
     print(f"Distance to goal: {np.linalg.norm(pos.mean(axis=0) - goal):.3f}")
 
 
+def run_circular(args: argparse.Namespace) -> None:
+    """Circular path scenario: 5-robot pentagon loops through 6 waypoints.
+
+    The team starts near the south waypoint and follows a counterclockwise
+    circle.  Two choke obstacles on the east side force the formation to shrink
+    in order to squeeze through, then re-expand on the far side.
+
+    Each iteration:
+        1. Run phases 1–6 with current robot positions to get new formation targets.
+        2. Simulate robots toward those targets until convergence (or max steps).
+        3. Advance to the next waypoint when the centroid is within GOAL_RADIUS.
+        4. Stop after visiting all 6 waypoints once (full loop complete).
+
+    What this mode shows (static):
+        - Circular waypoints as numbered markers on the path.
+        - All robot trajectories colored by planning iteration.
+        - Each iteration's agreed safe region drawn faintly.
+        - Choke obstacles in red.
+
+    With --animate:
+        - Live animation of all iterations played sequentially.
+
+    Args:
+        args: Parsed command-line arguments.
+            args.steps     — max simulation steps per planning iteration (default 100).
+            args.dt        — timestep in seconds.
+            args.max_iters — max replanning iterations across all waypoints (default 60).
+            args.animate   — live animation if set.
+    """
+    from simulation.scenario import create_circular_choke_scenario
+    from consensus.graph_utils import graph_diameter
+    from consensus.convex_hull import run_convex_hull_consensus
+    from consensus.preferred_direction import (
+        run_direction_consensus, select_preferred_direction
+    )
+    from geometry.free_space import compute_local_free_region, visible_obstacles
+    from consensus.region_consensus import run_region_consensus as _run_consensus
+    from formation.templates import TEMPLATES
+    from formation.optimizer import optimize_formation
+    from formation.assignment import solve_assignment
+    from robots.dynamics import (
+        step_double_integrator, compute_pd_acceleration,
+        project_velocity, project_velocity_obstacles
+    )
+    from plotting.draw_team import draw_rect_obstacles, ROBOT_COLORS
+    from plotting.draw_obstacles import draw_free_region
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    import matplotlib.cm as cm
+    import numpy as np
+
+    TARGET_TOL  = 0.05   # robots within this of their targets → converged
+    GOAL_RADIUS = 1.0    # centroid within this of current waypoint → advance
+    WORKSPACE   = (-2.0, -2.0, 12.0, 12.0)
+    tau         = 3.0
+    kp, kd      = 2.0, 2.0 * np.sqrt(2.0)
+    max_iters   = args.max_iters
+
+    scenario  = create_circular_choke_scenario()
+    agents    = scenario['agents']
+    adjacency = scenario['adjacency']
+    obstacles = scenario['obstacles']
+    waypoints = scenario['waypoints']
+
+    positions  = np.array([a.position for a in agents])
+    num_rounds = args.rounds if args.rounds else graph_diameter(adjacency)
+    dt         = args.dt
+
+    pos = positions.copy().astype(float)
+    vel = np.zeros_like(pos)
+
+    # Waypoint cycling state
+    current_wp       = 0
+    waypoints_visited = 0
+    loop_complete    = False
+
+    # Per-iteration records for plotting
+    iter_pos_histories: list[np.ndarray]                    = []
+    iter_slots:         list[np.ndarray]                    = []
+    iter_regions:       list[tuple[np.ndarray, np.ndarray]] = []
+    iter_assignments:   list[np.ndarray]                    = []
+    iter_wp_index:      list[int]                           = []  # waypoint at each iter
+
+    for iteration in range(max_iters):
+        goal = waypoints[current_wp]
+
+        # ---- Phase 1: hull consensus ----
+        hull_history  = run_convex_hull_consensus(pos, adjacency, num_rounds)
+        hull_vertices = hull_history[-1][0]
+        centroid      = hull_vertices.mean(axis=0)
+
+        # Check if already at this waypoint before replanning
+        if np.linalg.norm(centroid - goal) < GOAL_RADIUS:
+            waypoints_visited += 1
+            current_wp = (current_wp + 1) % len(waypoints)
+            if waypoints_visited == len(waypoints):
+                print("Full loop complete!")
+                loop_complete = True
+                break
+            goal = waypoints[current_wp]
+
+        # ---- Phase 2: preferred direction ----
+        candidate_angles = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+        _, final_utilities = run_direction_consensus(
+            pos, adjacency, obstacles, candidate_angles, num_rounds,
+            centroid=centroid, goal=goal,
+        )
+        theta_star = select_preferred_direction(final_utilities[0], candidate_angles)
+
+        # ---- Phase 3+4: local regions → agreed intersection ----
+        local_obs = [
+            visible_obstacles(pos[i], obstacles, agents[i].sensing_range)
+            for i in range(len(agents))
+        ]
+        local_regions = [
+            compute_local_free_region(
+                centroid, hull_vertices, local_obs[i],
+                workspace_bounds=WORKSPACE,
+                theta_star=theta_star, tau=tau,
+            )
+            for i in range(len(agents))
+        ]
+        _, (A_agreed, b_agreed) = _run_consensus(local_regions, adjacency, num_rounds)
+
+        # ---- Phase 5+6: formation + assignment ----
+        # Cap tau so the formation center doesn't overshoot the current waypoint.
+        direction_vec = np.array([np.cos(theta_star), np.sin(theta_star)])
+        dist_to_goal_along_dir = float(direction_vec @ (goal - centroid))
+        effective_tau = min(tau, max(dist_to_goal_along_dir, 0.0))
+        result = optimize_formation(A_agreed, b_agreed, TEMPLATES['pentagon'], theta_star,
+                                    centroid=centroid, tau=effective_tau)
+        if result is None:
+            print(f"Iteration {iteration + 1}: no feasible formation — stopping.")
+            break
+        _, _, _, slots = result
+        assignment, _ = solve_assignment(pos, slots)
+        targets = slots[assignment]
+
+        print(f"Iter {iteration + 1:2d} | WP {current_wp} | θ*={np.degrees(theta_star):6.1f}° | "
+              f"centroid=({centroid[0]:.2f},{centroid[1]:.2f}) | "
+              f"visited={waypoints_visited}/{len(waypoints)}")
+
+        # ---- Simulate until converged or max steps ----
+        iter_hist = [pos.copy()]
+        for _ in range(args.steps):
+            new_pos = np.zeros_like(pos)
+            new_vel = np.zeros_like(vel)
+            for i in range(len(agents)):
+                u = compute_pd_acceleration(pos[i], vel[i], targets[i], kp, kd)
+                v_cand = vel[i] + dt * u
+                v_proj = project_velocity(v_cand, pos[i], A_agreed, b_agreed)
+                v_proj = project_velocity_obstacles(v_proj, pos[i], obstacles)
+                new_pos[i], new_vel[i] = step_double_integrator(
+                    pos[i], v_proj, np.zeros(2), dt
+                )
+            pos = new_pos
+            vel = new_vel
+            iter_hist.append(pos.copy())
+            if all(np.linalg.norm(pos[i] - targets[i]) < TARGET_TOL
+                   for i in range(len(agents))):
+                break
+
+        iter_pos_histories.append(np.array(iter_hist))
+        iter_slots.append(slots)
+        iter_regions.append((A_agreed, b_agreed))
+        iter_assignments.append(assignment)
+        iter_wp_index.append(current_wp)
+
+        # Check waypoint after movement
+        centroid_now = pos.mean(axis=0)
+        if np.linalg.norm(centroid_now - goal) < GOAL_RADIUS:
+            waypoints_visited += 1
+            current_wp = (current_wp + 1) % len(waypoints)
+            if waypoints_visited == len(waypoints):
+                print("Full loop complete!")
+                loop_complete = True
+                break
+
+    if not loop_complete:
+        print(f"Max iterations ({max_iters}) reached — "
+              f"{waypoints_visited}/{len(waypoints)} waypoints visited.")
+
+    n_iters = len(iter_pos_histories)
+    if n_iters == 0:
+        print("No iterations ran — nothing to plot.")
+        return
+
+    # Iteration colors cycling through tab10
+    iter_colors = [cm.tab10(i % 10) for i in range(n_iters)]
+
+    # Axis bounds: workspace + small margin
+    x_lo, y_lo, x_hi, y_hi = WORKSPACE
+    margin = 0.5
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    draw_rect_obstacles(ax, obstacles)
+
+    # Draw circular waypoints as numbered markers
+    wp_arr = np.array(waypoints)
+    ax.scatter(wp_arr[:, 0], wp_arr[:, 1], marker='o', s=200,
+               color='gold', edgecolors='darkorange', linewidths=1.5,
+               zorder=8, label='Waypoints')
+    for idx, wp in enumerate(waypoints):
+        ax.text(wp[0] + 0.15, wp[1] + 0.15, str(idx), fontsize=10,
+                fontweight='bold', zorder=9, color='darkorange')
+
+    # Faint circle guide
+    theta_circ = np.linspace(0, 2 * np.pi, 200)
+    cx, cy, cr = 5.0, 5.0, 3.5
+    ax.plot(cx + cr * np.cos(theta_circ), cy + cr * np.sin(theta_circ),
+            '--', color='gray', linewidth=0.8, alpha=0.5, zorder=2)
+
+    ax.set_xlim(x_lo - margin, x_hi + margin)
+    ax.set_ylim(y_lo - margin, y_hi + margin)
+    ax.set_aspect('equal')
+
+    if not args.animate:
+        for k, hist in enumerate(iter_pos_histories):
+            c = iter_colors[k]
+            for i in range(len(agents)):
+                ax.plot(hist[:, i, 0], hist[:, i, 1],
+                        color=c, linewidth=1.5, alpha=0.8, zorder=4)
+            A_k, b_k = iter_regions[k]
+            draw_free_region(ax, A_k, b_k, color=c, alpha=0.07)
+            for s in iter_slots[k]:
+                ax.scatter(s[0], s[1], marker='*', s=120, color=c,
+                           edgecolors='black', linewidths=0.4, zorder=6, alpha=0.7)
+
+        # Starting robot positions
+        for i in range(len(agents)):
+            color = ROBOT_COLORS[i % len(ROBOT_COLORS)]
+            ax.scatter(positions[i, 0], positions[i, 1],
+                       color=color, s=100, zorder=7,
+                       edgecolors='black', linewidths=0.8)
+            ax.text(positions[i, 0] + 0.1, positions[i, 1] + 0.1,
+                    str(i), fontsize=9, zorder=8)
+
+        # Final robot positions
+        for i in range(len(agents)):
+            color = ROBOT_COLORS[i % len(ROBOT_COLORS)]
+            ax.scatter(pos[i, 0], pos[i, 1],
+                       color=color, s=100, marker='D', zorder=7,
+                       edgecolors='black', linewidths=0.8)
+
+        ax.set_title(
+            f"Circular choke: {n_iters} planning iters  |  "
+            f"{waypoints_visited}/{len(waypoints)} waypoints visited  "
+            f"({'loop complete' if loop_complete else 'incomplete'})"
+        )
+        ax.legend(loc='upper right', fontsize=8)
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        # Animated: flatten all frames with iteration tags
+        frames_pos  = []
+        frames_iter = []
+        for k, hist in enumerate(iter_pos_histories):
+            for t in range(len(hist)):
+                frames_pos.append(hist[t])
+                frames_iter.append(k)
+        total_frames = len(frames_pos)
+
+        region_patch = [None]
+
+        def _draw_region(k):
+            if region_patch[0] is not None:
+                region_patch[0].remove()
+                region_patch[0] = None
+            A_k, b_k = iter_regions[k]
+            draw_free_region(ax, A_k, b_k, color=iter_colors[k], alpha=0.15)
+
+        robot_dots = [
+            ax.scatter([], [], color=ROBOT_COLORS[i % len(ROBOT_COLORS)],
+                       s=80, zorder=6, edgecolors='black', linewidths=0.5)
+            for i in range(len(agents))
+        ]
+        trails = [
+            ax.plot([], [], color=ROBOT_COLORS[i % len(ROBOT_COLORS)],
+                    linewidth=1.2, alpha=0.6, zorder=4)[0]
+            for i in range(len(agents))
+        ]
+        slot_dots = ax.scatter([], [], marker='*', s=180, color='black',
+                               edgecolors='black', linewidths=0.4, zorder=7)
+        info_text = ax.text(0.02, 0.96, '', transform=ax.transAxes, fontsize=9)
+
+        current_iter = [-1]
+
+        def init():
+            for dot in robot_dots:
+                dot.set_offsets(np.empty((0, 2)))
+            for trail in trails:
+                trail.set_data([], [])
+            slot_dots.set_offsets(np.empty((0, 2)))
+            info_text.set_text('')
+            return robot_dots + trails + [slot_dots, info_text]
+
+        def update(frame):
+            k   = frames_iter[frame]
+            p   = frames_pos[frame]
+            hist = iter_pos_histories[k]
+            t_in_iter = frame - sum(len(iter_pos_histories[j]) for j in range(k))
+
+            if k != current_iter[0]:
+                current_iter[0] = k
+                _draw_region(k)
+                slot_dots.set_offsets(iter_slots[k])
+                slot_dots.set_color(iter_colors[k])
+
+            for i in range(len(agents)):
+                robot_dots[i].set_offsets([p[i]])
+                trail_x = hist[:t_in_iter + 1, i, 0]
+                trail_y = hist[:t_in_iter + 1, i, 1]
+                trails[i].set_data(trail_x, trail_y)
+
+            wp_idx = iter_wp_index[k]
+            info_text.set_text(
+                f"Iter {k + 1}/{n_iters}  WP {wp_idx}  step {t_in_iter}  "
+                f"t={t_in_iter * dt:.2f}s"
+            )
+            return robot_dots + trails + [slot_dots, info_text]
+
+        ax.set_title("Circular choke — iterative replanning")
+        ani = animation.FuncAnimation(
+            fig, update, frames=total_frames,
+            init_func=init, interval=40, blit=False
+        )
+        plt.tight_layout()
+        plt.show()
+
+    print(f"\nIterations run    : {n_iters}")
+    print(f"Waypoints visited : {waypoints_visited}/{len(waypoints)}")
+    print(f"Loop complete     : {loop_complete}")
+    print(f"Final centroid    : {pos.mean(axis=0)}")
+
+
 def run_full_demo(args: argparse.Namespace) -> None:
     """Phase 8: run the complete paper pipeline end-to-end.
 
@@ -1256,6 +1592,7 @@ MODES: dict = {
     "assignment":       run_assignment,
     "control":          run_control,
     "closed-loop":      run_closed_loop,
+    "circular":         run_circular,
     "full-demo":        run_full_demo,
 }
 

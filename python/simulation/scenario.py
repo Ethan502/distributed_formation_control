@@ -73,3 +73,74 @@ def create_default_scenario() -> dict:
 
     return {'agents': agents, 'adjacency': adjacency,
             'obstacles': obstacles, 'goal': goal}
+
+
+def create_circular_choke_scenario() -> dict:
+    """Create a 5-robot scenario where the team loops around a circular path.
+
+    Layout:
+        - 5 robots start in a loose cluster near the south waypoint (5, 1.5).
+        - 6 waypoints evenly spaced counterclockwise on a circle centered at
+          (5, 5) with radius 3.5.
+        - Two rectangular obstacles form a choke point on the east side
+          (centered at y=5), leaving a narrow gap of ~1.6 units.  The
+          pentagon template's unit-scale width is ~2.0, so the optimizer
+          must shrink the formation to roughly s ≤ 0.8 to squeeze through.
+
+    Waypoints (counterclockwise, starting south):
+        0: (5.0, 1.5)  — south  (start)
+        1: (8.5, 3.0)  — southeast
+        2: (8.5, 7.0)  — northeast  ← choke here
+        3: (5.0, 8.5)  — north
+        4: (1.5, 7.0)  — northwest
+        5: (1.5, 3.0)  — southwest
+
+    Communication graph:
+        Ring topology — same as the default scenario.
+
+    Returns:
+        scenario: dict with keys:
+            'agents'    : list of 5 Agent objects (zero initial velocity).
+            'adjacency' : np.ndarray of shape (5, 5), binary ring graph.
+            'obstacles' : list of 2 Rectangle objects (choke blocks).
+            'waypoints' : list of 6 np.ndarray of shape (2,).
+
+    Notes:
+        - There is no 'goal' key; the caller cycles through 'waypoints'.
+        - Workspace bounds for free-space computation should be (-2, -2, 12, 12).
+    """
+    # Robots start in a loose cluster near waypoint 0 (south side of circle)
+    positions = np.array([
+        [4.0, 1.8],
+        [4.5, 1.2],
+        [5.0, 1.5],
+        [5.5, 1.2],
+        [6.0, 1.8],
+    ])
+
+    agents = [Agent(id=i, position=positions[i], velocity=np.zeros(2))
+              for i in range(5)]
+
+    # Ring topology: 0–1–2–3–4–0
+    adjacency = np.zeros((5, 5), dtype=float)
+    for i in range(5):
+        adjacency[i, (i + 1) % 5] = adjacency[(i + 1) % 5, i] = 1
+
+    # Choke obstacles on the east side, leaving a ~1.6-unit gap at y ∈ [4.2, 5.8]
+    obstacles = [
+        Rectangle(x_min=7.5, y_min=5.8, x_max=11.0, y_max=9.5),   # upper block
+        Rectangle(x_min=7.5, y_min=0.5, x_max=11.0, y_max=4.2),   # lower block
+    ]
+
+    # 6 waypoints counterclockwise on a circle (center=(5,5), radius=3.5)
+    waypoints = [
+        np.array([5.0, 1.5]),   # 0 south
+        np.array([8.5, 3.0]),   # 1 southeast
+        np.array([8.5, 7.0]),   # 2 northeast  (choke)
+        np.array([5.0, 8.5]),   # 3 north
+        np.array([1.5, 7.0]),   # 4 northwest
+        np.array([1.5, 3.0]),   # 5 southwest
+    ]
+
+    return {'agents': agents, 'adjacency': adjacency,
+            'obstacles': obstacles, 'waypoints': waypoints}
