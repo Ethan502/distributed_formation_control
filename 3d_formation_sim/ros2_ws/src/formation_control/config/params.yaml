@@ -1,0 +1,43 @@
+# Formation control parameters
+# Loaded by all nodes via launch file
+/**:
+  ros__parameters:
+    formation_control:
+      # Number of drones
+      num_drones: 4
+
+      # Sensing range for obstacle detection (meters)
+      sensing_range: 6.0
+
+      # Takeoff altitude in ENU (meters)
+      takeoff_altitude: 3.0
+
+      # Goal position in ENU [x, y, z]
+      goal: [15.0, 0.0, 3.0]
+
+      # Movement speed (m/s)
+      move_speed: 2.0
+
+      # Position tolerance for arrival (m)
+      position_tolerance: 0.5
+
+      # Goal radius for mission success (m)
+      goal_radius: 2.0
+
+      # Adjacency matrix flattened (4x4 ring topology: 0-1, 1-2, 2-3, 3-0)
+      adjacency_flat: [0, 1, 0, 1,
+                        1, 0, 1, 0,
+                        0, 1, 0, 1,
+                        1, 0, 1, 0]
+
+      # Obstacles as a single flat array [xmin,ymin,zmin,xmax,ymax,zmax, ...]
+      # Two walls forming a gate (each wall is 6 floats)
+      obstacles_flat: [-2.0, -10.0, 0.0, 2.0, -2.0, 7.0,
+                        -2.0, 2.0, 0.0, 2.0, 10.0, 7.0]
+
+      # Algorithm parameters
+      num_candidate_directions: 50
+      template_name: "line"
+      workspace_bounds: [-20.0, -15.0, 0.5, 20.0, 15.0, 8.0]
+      max_replan_iterations: 10
+      tau: 3.0
