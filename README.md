@@ -6,6 +6,18 @@ A distributed multi-robot formation control system based on [Alonso-Mora et al. 
 
 **Left**: The greedy (myopic) planner gets stuck — it picks the direction with the best one-step clearance, which points away from the goal when a large obstacle blocks the direct path. **Right**: The VI planner computes globally optimal cost-to-go and routes the swarm around the obstacle bottom.
 
+### Animation
+
+![VI planner animation](docs/figures/vi_animation.gif)
+
+The swarm navigates south under the obstacle, east along the gap, then north to the goal — a multi-step detour the greedy planner cannot discover. Blue arrows show theta\* from the VI gradient at each iteration.
+
+To run the animation yourself:
+
+```bash
+python -m me595.run
+```
+
 ---
 
 ## The Problem
@@ -96,29 +108,26 @@ The cost-to-go field wraps smoothly around the obstacle. Dark purple = low cost 
 
 ## How to Run
 
+Requires Python 3 with `numpy`, `matplotlib`, and `scipy`.
+
 ```bash
-# Setup (one time)
-python -m venv env
-source env/bin/activate
-pip install numpy matplotlib scipy
+# VI planner (default) — opens animated plot, swarm reaches goal
+python -m me595.run
 
-# VI planner (default) — navigates around obstacle, reaches goal
-./env/bin/python -m me595.run
+# Greedy planner — opens animated plot, swarm gets stuck (for comparison)
+python -m me595.run --planner greedy
 
-# Greedy planner — gets stuck (for comparison)
-./env/bin/python -m me595.run --planner greedy
+# Show value function heatmap before the animation starts
+python -m me595.run --show-value-map
 
-# Show value function heatmap before running
-./env/bin/python -m me595.run --show-value-map
+# Static summary plot instead of animation
+python -m me595.run --no-animate
 
-# Static plot instead of animation
-./env/bin/python -m me595.run --no-animate
-
-# Standalone value function visualization
-./env/bin/python -m me595.grid_mdp
+# Standalone value function visualization (no simulation)
+python -m me595.grid_mdp
 
 # Regenerate README figures
-./env/bin/python docs/generate_figures.py
+python docs/generate_figures.py
 ```
 
 ### CLI Options
