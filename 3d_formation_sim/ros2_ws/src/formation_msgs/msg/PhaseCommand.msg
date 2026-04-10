@@ -1,0 +1,14 @@
+# Phase constants
+uint8 IDLE=0
+uint8 TAKEOFF=1
+uint8 HULL_CONSENSUS=2
+uint8 DIRECTION_CONSENSUS=3
+uint8 COMPUTE_FREE_REGION=4
+uint8 REGION_CONSENSUS=5
+uint8 COMPUTE_FORMATION=6
+uint8 ASSIGNMENT=7
+uint8 MOVE_TO_TARGET=8
+uint8 LAND=9
+
+uint8 phase
+uint32 num_rounds

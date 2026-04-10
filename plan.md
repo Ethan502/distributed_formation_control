@@ -1,546 +1,391 @@
-# PLAN.md
+# PLAN.md — Value Iteration Path Planning for me595
 
-## Goal
-Implement the paper in a **Python-only 2D simulation** in small, visible, paper-aligned chunks. The plan should help the user learn the algorithm, not just finish it.
+## Problem Statement
 
-The implementation assumptions for this phase are:
-- 2D simulation
-- 5 robots
-- double-integrator robot model
-- adjacency-matrix communication
-- perfect knowledge of robot states
-- axis-aligned rectangular obstacles
-- one `main.py` with command-line modes
-- reusable shared modules
+The current me595 closed-loop runner gets stuck. The preferred-direction
+consensus (Phase 2) selects the direction with the best one-step ray
+clearance weighted toward the goal. This is **myopic**: it cannot reason
+about multi-step detours. When the merged triangle+rectangle obstacle
+blocks the direct path to the goal, the algorithm locks onto a direction
+with high clearance (away from the obstacle) that makes no progress.
 
----
+**Observed failure**: the swarm starts at ~(1, 4), needs to reach (12, 3).
+The obstacle spans x in [1, 8], y in [-2, 15.66]. The greedy direction
+consensus picks 258.8 deg (south-southwest — lots of clearance, moderate
+goal weight) and the centroid stays fixed at (2.67, 7.57) for all 20
+iterations.
 
-## High-level paper pipeline
-The paper’s implementation will be developed in this order:
-1. simulation scaffolding,
-2. distributed convex hull consensus,
-3. preferred direction consensus,
-4. local safe-region construction,
-5. consensus intersection of safe regions,
-6. formation template and optimization,
-7. robot-to-slot assignment,
-8. closed-loop robot motion to assigned targets,
-9. integrated full-paper demo in Python.
-
-The paper introduces exactly these major distributed ingredients: consensus on the convex hull of robot positions, consensus on a preferred direction of motion through a max-min utility rule, and consensus on a convex free position-time region by intersecting individual regions. fileciteturn3file1L170-L176 fileciteturn3file3L14-L27 The algorithm then computes a target formation inside the agreed region, assigns robots to target slots, and runs a high-frequency control loop toward those targets. fileciteturn3file4L1-L16
+**Required fix**: replace the myopic direction selection with a planner
+that can see "go south around the bottom of the obstacle, then east to the
+goal" — a path that requires committing to a direction that temporarily
+moves away from the goal.
 
 ---
 
-## Global implementation strategy
+## Chosen Algorithm: Value Iteration on a Grid MDP
 
-### Philosophy
-Each phase should produce one of the following:
-- a plot,
-- an animation,
-- a printed consensus result,
-- a target formation overlay,
-- trajectories.
+Reference: Kochenderfer, "Algorithms for Decision Making", Chapter 7
+(Exact Solution Methods), Section 7.4 (Value Iteration).
 
-### One-mode-per-phase style
-The repository will use a single `main.py` with modes such as:
+### Core idea
 
-```bash
-python main.py --mode scaffold
-python main.py --mode hull
-python main.py --mode direction
-python main.py --mode local-free-space
-python main.py --mode region-consensus
-python main.py --mode formation
-python main.py --mode assignment
-python main.py --mode control
-python main.py --mode full-demo
-```
+Discretize the 2D workspace into a grid. Each cell is a **state** in an
+MDP. Actions are moves to the 8 neighboring cells (N, NE, E, SE, S, SW, W,
+NW). Obstacle cells are impassable. The goal cell has cost 0; every move
+costs its Euclidean distance (1.0 for cardinal, sqrt(2) for diagonal).
 
-### Expected dependencies
-Primary:
-- `numpy`
-- `matplotlib`
-- `scipy`
-- `cvxpy`
+**Value iteration** (Bellman updates) computes V(s) = minimum cost-to-go
+from every cell s to the goal:
 
-Optional later only if clearly useful:
-- `shapely`
+    V(s) <- min_a [ cost(s, a) + V(s') ]
 
-For the first implementation, avoid optional dependencies unless the geometry becomes too cumbersome.
+where s' is the cell reached by action a from s. Impassable cells get
+V = infinity. After convergence, V encodes the globally optimal distance
+to the goal around all obstacles.
 
----
+### Direction extraction
 
-## Phase 0 — Simulation scaffold
+At the hull centroid c, the preferred direction theta_star is extracted
+from the gradient of V:
 
-### Objective
-Build the smallest possible reusable simulation environment for 5 robots in 2D.
+    grad_V = ( V(c + dx) - V(c - dx),  V(c + dy) - V(c - dy) )  /  (2 * cell_size)
+    theta_star = atan2(-grad_V[1], -grad_V[0])
 
-### Why this comes first
-Before implementing any consensus or geometry, the user needs a way to:
-- place robots in the plane,
-- define an adjacency matrix,
-- draw obstacles,
-- run repeatable demos.
+This points "downhill" on the value surface — toward the goal along the
+globally shortest path. The gradient is estimated by finite differences on
+the grid, with bilinear interpolation for non-grid-aligned centroids.
 
-### Math/Model
-For robot \(i\), use the 2D double-integrator model:
-\[
-\dot p_i = v_i, \qquad \dot v_i = u_i
-\]
-with discrete simulation step \(\Delta t\):
-\[
-p_i^{k+1} = p_i^k + \Delta t\, v_i^k,
-\qquad
-v_i^{k+1} = v_i^k + \Delta t\, u_i^k.
-\]
+### Distributed framing
 
-### Deliverables
-- `robots/agent.py`
-- `robots/dynamics.py`
-- `consensus/graph_utils.py`
-- `geometry/rectangles.py`
-- `plotting/draw_team.py`
-- `simulation/scenario.py`
-- `main.py --mode scaffold`
+The distributed structure mirrors the existing utility consensus:
 
-### What `--mode scaffold` should show
-- 5 robot positions
-- velocity arrows
-- adjacency graph edges
-- one or two rectangular obstacles
-- goal point
+1. Each robot i computes V_i on the full grid using only its **locally
+   visible obstacles** (those within sensing_range).
+2. Robots run **max-consensus** on V vectors:
+       V_i(k+1) = max_{j in N_i} ( V_i(k), V_j(k) )   element-wise.
+   Higher V = higher cost = more conservative. Taking the max respects
+   every robot's obstacle knowledge.
+3. After d rounds (graph diameter), all robots agree on V_agreed.
+4. Each robot extracts theta_star from grad(V_agreed) at the centroid.
 
-### Functions to scaffold
-- `create_default_scenario()`
-- `validate_adjacency_matrix()`
-- `get_neighbors()`
-- `step_double_integrator()`
-- `draw_team_state()`
-- `draw_rect_obstacles()`
+In the current me595 scenario all robots have sensing_range=20 and see
+every obstacle, so the consensus is a no-op. But the code structure
+supports the general case where robots have limited sensing.
 
-### Done when
-- the plot renders cleanly,
-- adjacency is easy to inspect,
-- changing robot positions or obstacle rectangles is easy.
+### Why this works
+
+Value iteration "floods" cost outward from the goal. The obstacle creates
+a cost shadow: cells behind it have high V because the shortest path goes
+around. The gradient of V at any point gives the locally optimal step
+toward the goal. Even at (2.67, 7.57) — where the greedy planner gets
+stuck — the VI gradient will point south-southeast (toward the bottom of
+the triangle), because that is the start of the shortest path to (12, 3).
 
 ---
 
-## Phase 1 — Distributed convex hull consensus
+## Integration with the Existing Pipeline
 
-### Objective
-Implement the first true paper algorithmic block: all robots reach agreement on the convex hull of robot positions using only local communication.
+Only **Phase 2** (direction selection) changes. Phases 1, 3-7 are
+untouched:
 
-### Paper idea
-The paper begins by having each robot propagate hull information through the communication graph. Each robot starts with only its own position, updates its local convex hull by combining it with neighbors’ hull information, and converges in at most the graph diameter when the graph is connected. fileciteturn3file0L1-L17 fileciteturn3file0L18-L31
+| Phase | Current (greedy) | New (VI) |
+|-------|-----------------|----------|
+| 1. Hull consensus | unchanged | unchanged |
+| 2. Direction | ray-clearance min-consensus | gradient of V from grid MDP |
+| 3. Local free regions | unchanged | unchanged |
+| 4. Region consensus | unchanged | unchanged |
+| 5. Formation optimizer | unchanged | unchanged |
+| 6. Assignment | unchanged | unchanged |
+| 7. PD control + projection | unchanged | unchanged |
 
-### Math summary
-Let \(C_i(k)\) be robot \(i\)'s local hull estimate after round \(k\). The paper shows the update idea as:
-\[
-C_i(k+1) = \operatorname{convhull}(C_i(k), C_j(k))
-\]
-across neighbor exchanges, and proves convergence to the global convex hull in at most the graph diameter for connected graphs. fileciteturn3file0L1-L17
-
-### Implementation simplification
-For the first version:
-- store sets of candidate points locally,
-- union with neighbor sets,
-- recompute hull each round,
-- convergence can be checked by equality of hull vertex sets.
-
-### Deliverables
-- `geometry/hulls.py`
-- `consensus/convex_hull.py`
-- `plotting/draw_hulls.py`
-- `main.py --mode hull`
-
-### What `--mode hull` should show
-Option A:
-- all robots in one figure,
-- true global hull,
-- one selected robot’s current local hull estimate,
-- iteration count.
-
-Option B:
-- subplots for all robots’ local hull estimates by round.
-
-### Functions to scaffold
-- `compute_convex_hull(points)`
-- `extract_hull_vertices(points)`
-- `run_convex_hull_consensus(points, adjacency, num_rounds)`
-- `did_hulls_converge(hull_history)`
-- `draw_local_hull_estimates(...)`
-
-### Done when
-- every robot ends with the same hull,
-- the result matches the centralized hull,
-- the user can see convergence round by round.
+The `--planner` flag in `me595/run.py` selects between `greedy` (current)
+and `vi` (new). Both paths produce a single float `theta_star` that the
+rest of the pipeline consumes.
 
 ---
 
-## Phase 2 — Preferred direction consensus
+## Preserving the Current Algorithm
 
-### Objective
-Implement the paper’s optional but important max-min consensus step for choosing a preferred direction of motion.
+The user needs to demonstrate before/after. The current greedy planner
+must remain runnable:
 
-### Paper idea
-After the hull is known, the team computes a preferred direction from the hull centroid toward the goal. Because obstacles may block some directions for some robots, the paper considers a discrete set of candidate directions \(\Theta\), lets each robot assign a utility to each direction, then performs a componentwise min-consensus so the team chooses the direction with the best worst-case utility. fileciteturn3file2L27-L41 fileciteturn3file3L1-L27
+    ./env/bin/python -m me595.run --planner greedy     # current (gets stuck)
+    ./env/bin/python -m me595.run --planner vi          # new (navigates around)
+    ./env/bin/python -m me595.run                       # default = vi
 
-### Math summary
-Each robot defines a utility function \(u_i(\theta)\) over candidate angles. The global utility is
-\[
-u(\theta) = \min_{i \in I} u_i(\theta)
-\]
-and the team selects
-\[
-\theta^* = \arg\max_{\theta \in \Theta} u(\theta).
-\]
-Distributed update:
-\[
-\mathbf{u}_i(k+1) = \min_{j \in N_i} \big(\mathbf{u}_i(k), \mathbf{u}_j(k)\big)
-\]
-with componentwise minimum. fileciteturn3file3L11-L27
-
-### First implementation choice
-Use a simple utility function based on distance from the robot to the nearest obstacle boundary along a ray in candidate direction \(\theta\).
-
-This is not the only possible utility, but it is intuitive and visual.
-
-### Deliverables
-- `consensus/preferred_direction.py`
-- `geometry/free_space.py` (first small helpers only)
-- `plotting/draw_direction.py` or extend existing plotting module
-- `main.py --mode direction`
-
-### What `--mode direction` should show
-- robot positions and obstacles,
-- hull centroid,
-- goal point,
-- candidate rays,
-- local per-robot utilities,
-- chosen team direction.
-
-### Functions to scaffold
-- `compute_hull_centroid(hull_vertices)`
-- `sample_candidate_directions(num_angles)`
-- `ray_rectangle_intersection_distance(origin, direction, rect)`
-- `compute_direction_utility(robot_position, obstacles, theta)`
-- `run_min_consensus_on_utilities(local_utilities, adjacency)`
-- `select_best_direction(global_utilities)`
-
-### Done when
-- all robots agree on the same direction,
-- the chosen direction visibly avoids blocked directions better than a naive straight-to-goal direction in the test scenario.
+No existing code should be deleted. The greedy path in `me595/geometry.py`
+(`run_direction_consensus`, `compute_local_utilities`, `ray_clearance`)
+stays intact.
 
 ---
 
-## Phase 3 — Local obstacle-free region construction
+## Implementation Phases
 
-### Objective
-Give each robot a local safe region that encodes where the formation could move without intersecting the obstacles seen by that robot.
+### Phase A: Grid MDP Infrastructure
 
-### Paper idea
-The paper computes convex regions in free position-time space and later intersects them across robots. fileciteturn3file1L170-L176 This is one of the harder parts of the method, so the first implementation should use a teaching-first stepping stone.
+**New file**: `me595/grid_mdp.py`
 
-### Recommended first simplification
-Instead of jumping to a full generic polytope representation in position-time space, start by constructing **simple convex half-space constraints in 2D** around rectangular obstacles for a chosen motion direction and planning horizon.
+Build the grid representation and obstacle marking.
 
-Possible stepping-stone options:
-1. 2D position-only safe corridor approximation,
-2. 2D position-time prism approximation,
-3. full half-space polytope representation.
-
-Recommended order:
-- start with position-only convex safe region,
-- then augment with time if needed for paper fidelity.
-
-### Deliverables
-- `geometry/free_space.py`
-- `geometry/polygons.py`
-- `main.py --mode local-free-space`
-
-### What `--mode local-free-space` should show
-- one robot’s local obstacle perception,
-- its resulting local convex safe region,
-- the current hull / centroid / preferred direction overlaid for context.
-
-### Functions to scaffold
-- `build_local_free_region(robot_state, obstacles, preferred_direction, horizon)`
-- `polygon_from_halfspaces(...)`
-- `clip_region_with_obstacle_constraints(...)`
-- `draw_local_free_region(...)`
-
-### Done when
-- each robot can compute a local region,
-- the region is convex and drawable,
-- the output changes in sensible ways when obstacles move.
-
----
-
-## Phase 4 — Consensus intersection of local safe regions
-
-### Objective
-Have all robots agree on a common safe region by intersecting their local regions through distributed communication.
-
-### Paper idea
-A central part of the paper is distributed consensus on a convex free region in position-time space, obtained by intersecting individual regions. fileciteturn3file1L170-L176 In Python, a first version can represent regions explicitly with half-space matrices or polygon vertices.
-
-### Representation choice
-Prefer half-space form when practical:
-\[
-P = \{x \mid Ax \le b\}
-\]
-because intersection is then just stacking constraints.
-
-### Deliverables
-- `geometry/free_space.py`
-- `consensus/region_consensus.py` or extend `free_space.py`
-- `main.py --mode region-consensus`
-
-### What `--mode region-consensus` should show
-- each robot’s local safe region,
-- the agreed common region,
-- any regions that are empty or overly restrictive.
-
-### Functions to scaffold
-- `region_to_halfspaces(region)`
-- `intersect_halfspace_regions(region_a, region_b)`
-- `run_region_consensus(local_regions, adjacency, num_rounds)`
-- `is_region_empty(region)`
-
-### Done when
-- all robots converge to the same region,
-- the agreed region is the same as the centralized intersection,
-- the region can be visualized reliably.
-
----
-
-## Phase 5 — Formation templates and formation optimization
-
-### Objective
-Compute a target formation that fits inside the agreed safe region and is oriented according to the preferred direction.
-
-### Paper idea
-Once the common region is known, the paper solves a formation optimization problem to find the best template and configuration. fileciteturn3file4L1-L8 In the Python learning version, start with a small library of templates.
-
-### First template library
-Use 2D versions of:
-- line,
-- V-shape,
-- pentagon,
-- rectangle-like formation.
-
-### First optimization scope
-Optimize a reduced parameter vector such as:
-- formation center,
-- scale,
-- rotation.
-
-If needed later, extend to additional shape parameters.
-
-### Deliverables
-- `formation/templates.py`
-- `formation/optimizer.py`
-- `main.py --mode formation`
-
-### What `--mode formation` should show
-- agreed safe region,
-- candidate formations,
-- best formation selected,
-- target slot positions.
-
-### Functions to scaffold
-- `generate_template_points(template_name, num_robots)`
-- `apply_similarity_transform(template_points, center, scale, angle)`
-- `formation_constraints_within_region(template_points, region)`
-- `solve_best_formation(region, preferred_direction, templates)`
-
-### Done when
-- a valid formation is found inside the region,
-- the selected result is visually reasonable,
-- changing the obstacle layout changes the chosen formation or scale.
-
----
-
-## Phase 6 — Robot-to-slot assignment
-
-### Objective
-Assign the current robots to target formation slots.
-
-### Paper idea
-The paper formulates an assignment problem minimizing the sum of squared traveled distances to formation slots. fileciteturn3file4L8-L16 For the Python phase, a centralized solver is acceptable.
-
-### Math summary
-Given current robot positions \(p_i\) and target slot positions \(r_j^*\), solve:
-\[
-\min_X \sum_i \sum_j x_{ij}\|p_i-r_j^*\|^2
-\]
-where \(X\) is a permutation matrix. fileciteturn3file4L8-L16
-
-### Deliverables
-- `formation/assignment.py`
-- `main.py --mode assignment`
-
-### What `--mode assignment` should show
-- current robot positions,
-- target slot positions,
-- assignment lines,
-- total assignment cost.
-
-### Functions to scaffold
-- `compute_assignment_cost_matrix(robot_positions, target_positions)`
-- `solve_assignment(cost_matrix)`
-- `draw_assignment(robot_positions, target_positions, assignment)`
-
-### Done when
-- each robot gets one slot,
-- visual lines match intuition,
-- assignment cost is printed.
-
----
-
-## Phase 7 — Closed-loop motion with double-integrator robots
-
-### Objective
-Move the robots to their assigned targets using the double-integrator model.
-
-### First controller
-Use a simple PD tracking law:
-\[
-u_i = -K_p(p_i-r_i^*) - K_d(v_i-v_i^*)
-\]
-with \(v_i^*=0\) for the first version.
-
-### Deliverables
-- `robots/dynamics.py`
-- `simulation/runner.py`
-- `main.py --mode control`
-
-### What `--mode control` should show
-- animated trajectories,
-- current robot positions,
-- target slot positions,
-- velocity vectors,
-- optional collision checks.
-
-### Functions to scaffold
-- `compute_pd_acceleration(state, target_position, gains)`
-- `simulate_team_to_targets(team_state, target_positions, controller, dt, steps)`
-- `check_robot_robot_collisions(...)`
-- `check_robot_obstacle_collisions(...)`
-
-### Done when
-- robots visibly converge toward targets,
-- trajectories are smooth,
-- no obvious numerical instability occurs.
-
----
-
-## Phase 8 — Full integrated demo
-
-### Objective
-Run the full Python pipeline in one scenario:
-1. hull consensus,
-2. preferred direction consensus,
-3. local region generation,
-4. region intersection,
-5. formation optimization,
-6. assignment,
-7. closed-loop motion.
-
-### Deliverables
-- `main.py --mode full-demo`
-- scenario presets with at least one moving-obstacle example
-
-### What `--mode full-demo` should show
-- step-by-step or staged animation,
-- printed summaries for each algorithm block,
-- optional pause between stages.
-
-### Done when
-- the whole paper pipeline is visible in one run,
-- each step can still be run independently,
-- the codebase is still readable.
-
----
-
-## Suggested `main.py` CLI structure
+#### Data structures
 
 ```python
-parser.add_argument("--mode", type=str, required=True)
-parser.add_argument("--scenario", type=str, default="default")
-parser.add_argument("--rounds", type=int, default=None)
-parser.add_argument("--dt", type=float, default=0.1)
-parser.add_argument("--steps", type=int, default=100)
-parser.add_argument("--animate", action="store_true")
+@dataclass
+class GridMDP:
+    x_min: float          # workspace left edge
+    y_min: float          # workspace bottom edge
+    x_max: float          # workspace right edge
+    y_max: float          # workspace top edge
+    cell_size: float      # meters per cell (default 0.25)
+    blocked: np.ndarray   # bool array (rows, cols) — True = impassable
+    values: np.ndarray    # float array (rows, cols) — V(s), inf for blocked
+    goal_ij: tuple[int, int]  # grid indices of the goal cell
 ```
 
-Suggested modes:
-- `scaffold`
-- `hull`
-- `direction`
-- `local-free-space`
-- `region-consensus`
-- `formation`
-- `assignment`
-- `control`
-- `full-demo`
+#### Functions to implement
+
+1. `create_grid(workspace_bounds, cell_size) -> GridMDP`
+   - Allocate the grid arrays.
+   - Initialize `values` to inf everywhere except the goal cell (0).
+   - `blocked` starts all-False.
+
+2. `mark_obstacles(grid, obstacles) -> None`
+   - For each cell, test if its center is inside any obstacle.
+   - Use `polygon_contains_point` from `me595/geometry.py`.
+   - Optionally inflate obstacles by a safety margin (half the robot
+     inter-collision radius, ~0.15 m).
+   - Set `blocked[i, j] = True` and `values[i, j] = inf`.
+
+3. `world_to_grid(grid, point) -> (int, int)`
+   - Convert world (x, y) to grid row, col indices.
+
+4. `grid_to_world(grid, i, j) -> np.ndarray`
+   - Convert grid (row, col) back to world (x, y).
+
+#### Done when
+
+- A grid can be created for the me595 workspace.
+- Obstacle cells match the triangle + rectangle footprint.
+- A simple matplotlib `imshow` of `blocked` looks correct.
 
 ---
 
-## Recommended first coding session
-The first session should only cover **Phase 0** and set up placeholders for **Phase 1**.
+### Phase B: Value Iteration Solver
 
-### Session 1 tasks
-1. Create the folder structure.
-2. Implement `create_default_scenario()`.
-3. Implement adjacency validation and neighbor lookup.
-4. Implement 2D robot state container.
-5. Implement a basic plotting function for robots, graph edges, obstacles, and goal.
-6. Add `python main.py --mode scaffold`.
-7. Add stub files and stub functions for hull consensus.
+**Same file**: `me595/grid_mdp.py`
 
-### Why this is the right first step
-It is small, visible, and immediately useful. It also prepares the exact data structures needed for the first real paper step: convex hull consensus.
+Implement the Bellman update loop.
 
----
+#### Functions to implement
 
-## Recommended second coding session
-The second session should implement **Phase 1** fully.
+1. `neighbors_8(i, j, rows, cols) -> list[tuple[int, int, float]]`
+   - Return up-to-8 neighbor cells and their step costs.
+   - Cardinal neighbors: cost = cell_size.
+   - Diagonal neighbors: cost = cell_size * sqrt(2).
+   - Skip out-of-bounds cells.
 
-### Session 2 tasks
-1. Add centralized convex hull helper.
-2. Add local robot hull storage.
-3. Implement one consensus round.
-4. Implement repeated rounds until convergence.
-5. Plot local hull evolution.
-6. Add `python main.py --mode hull`.
+2. `value_iteration(grid, tol=1e-3, max_iters=500) -> int`
+   - Standard synchronous Bellman update:
+     ```
+     for each non-blocked cell (i, j):
+         V_new[i,j] = min over neighbors (r,c,cost):
+             cost + V_old[r, c]   if not blocked[r, c]
+     ```
+   - Iterate until max change < tol or max_iters reached.
+   - Update `grid.values` in-place.
+   - Return the number of iterations used.
 
----
+3. `extract_direction(grid, point) -> float`
+   - Given a world-coordinate point (the hull centroid), compute
+     theta_star from the gradient of V using finite differences.
+   - Use bilinear interpolation for sub-cell accuracy.
+   - Return the angle in radians.
 
-## Learning checklist for each phase
-For every phase, the user should be able to answer:
-1. What information does each robot store locally?
-2. What does each robot send to its neighbors?
-3. What update rule is applied each round?
-4. What object is the team converging to?
-5. How can I verify correctness visually?
-6. What module will reuse this result later?
+#### Performance note
 
----
+For cell_size=0.25, the grid is 64x80 = 5120 cells. Value iteration on
+this grid converges in ~200 iterations, each sweeping 5120 cells.
+Total: ~1M cell updates — well under 1 second in NumPy. No need for
+compiled code.
 
-## Stretch goals for later, but not now
-Do not implement these yet unless requested:
-- noisy localization,
-- asynchronous communication,
-- packet drops,
-- 3D extension,
-- ROS2 nodes,
-- Gazebo integration,
-- real quadrotor dynamics,
-- distributed assignment solver,
-- dynamic obstacle prediction beyond a simple first version.
+#### Done when
+
+- `value_iteration` converges on the me595 grid.
+- V values near the goal are low, V values behind the obstacle are high.
+- `extract_direction` at (2.67, 7.57) returns a south-ish angle (toward
+  the bottom of the triangle), not 258.8 deg.
+- A heatmap of V with the obstacle overlaid looks like a distance field
+  that wraps around the obstacle.
 
 ---
 
-## Immediate next step
-Start by implementing **Phase 0: Simulation scaffold** and create enough shared structure that **Phase 1: convex hull consensus** can be added cleanly in the next iteration.
+### Phase C: Distributed Value Consensus
+
+**New file**: `me595/value_planner.py`
+
+Wrap the grid MDP in a distributed-consensus-compatible interface.
+
+#### Functions to implement
+
+1. `compute_local_value_function(obstacles, workspace_bounds, goal, cell_size, sensing_range=None) -> GridMDP`
+   - Create grid, mark obstacles, run VI, return the solved grid.
+   - If sensing_range is provided, only mark obstacles within that range
+     of the grid center (for future partial-observability support).
+
+2. `run_value_consensus(local_grids, adjacency, num_rounds) -> GridMDP`
+   - Each robot has a local GridMDP with its own `values` array.
+   - Max-consensus on the flattened value vectors:
+     ```
+     V_i(k+1) = element-wise max over j in N_i of V_j(k)
+     ```
+   - After num_rounds, all grids agree. Return the agreed grid.
+   - (When all robots see the same obstacles, this is an identity
+     operation. The code still runs it for structural consistency.)
+
+3. `plan_direction(grid, centroid) -> float`
+   - Thin wrapper: call `extract_direction(grid, centroid)`.
+   - Returns theta_star.
+
+#### Done when
+
+- `plan_direction` at the me595 starting centroid returns a direction
+  that, if followed iteratively, traces a path around the obstacle
+  bottom toward (12, 3).
+- The distributed consensus produces the same result as a single robot
+  running VI alone (since all robots see everything).
+
+---
+
+### Phase D: Integration with run.py
+
+**Modify**: `me595/run.py`
+
+Add the `--planner` CLI flag and wire the VI planner into the main loop.
+
+#### Changes
+
+1. Add argument: `--planner {greedy,vi}` with default `vi`.
+
+2. If `planner == "vi"`:
+   - Before the main loop, call `compute_local_value_function` once for
+     each robot. Run `run_value_consensus` to get `agreed_grid`.
+   - Since obstacles are static, this only needs to happen **once**
+     (not every iteration). The value function doesn't change.
+   - In the main loop, replace the direction-consensus block (Phase 2)
+     with:
+     ```python
+     theta_star = plan_direction(agreed_grid, centroid)
+     ```
+
+3. If `planner == "greedy"`:
+   - Run the existing `run_direction_consensus` + `select_preferred_direction`
+     code, unchanged.
+
+4. Print the planner type in the header line:
+   ```
+   me595 closed-loop run  |  N=5 robots  |  planner=vi  |  diameter=2
+   ```
+
+#### Done when
+
+- `./env/bin/python -m me595.run --planner greedy` reproduces the stuck
+  behavior (centroid at ~(2.67, 7.57), 20 iterations, no progress).
+- `./env/bin/python -m me595.run --planner vi` navigates the swarm
+  around the bottom of the obstacle toward (12, 3).
+- `./env/bin/python -m me595.run` defaults to vi.
+
+---
+
+### Phase E: Visualization and Testing
+
+Add diagnostic plots so the user can see what VI is doing.
+
+#### Additions
+
+1. **Value function heatmap**: add a `--show-value-map` flag to
+   `me595/run.py` that displays the V grid as a color map with the
+   obstacle silhouette, goal marker, and the gradient-arrow at the
+   centroid overlaid. This is shown once before the main loop starts.
+
+2. **Path preview**: on the heatmap, trace the gradient-descent path
+   from the starting centroid to the goal. This is the "ideal" centroid
+   trajectory that VI would produce if the formation were a point.
+
+3. **Direction arrow in animation**: during the animated run, draw a
+   small arrow at the centroid showing theta_star for each iteration.
+   Color it by planner type (blue for VI, red for greedy) so the
+   before/after comparison is visually obvious.
+
+#### Done when
+
+- The heatmap clearly shows the cost-to-go wrapping around the obstacle.
+- The gradient-descent path visually goes around the obstacle bottom.
+- The animated run with `--planner vi` shows the swarm tracking that path.
+
+---
+
+## File Summary
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `me595/grid_mdp.py` | NEW | Grid MDP: creation, obstacle marking, value iteration, direction extraction |
+| `me595/value_planner.py` | NEW | Distributed VI wrapper: local V computation, max-consensus, plan_direction |
+| `me595/run.py` | MODIFY | Add `--planner {greedy,vi}` flag, wire VI into Phase 2 |
+| `me595/geometry.py` | UNCHANGED | Greedy planner code stays for `--planner greedy` |
+| `me595/dynamics.py` | UNCHANGED | Velocity projection unchanged |
+| `me595/scenario.py` | UNCHANGED | Scenario unchanged |
+
+---
+
+## Suggested Implementation Order
+
+1. **Phase A** first — get the grid and obstacle marking working, verify
+   with an imshow plot.
+2. **Phase B** next — implement VI and verify the value heatmap looks
+   correct (smooth cost field wrapping around obstacle).
+3. **Phase C** — wrap in distributed consensus interface.
+4. **Phase D** — wire into run.py with `--planner` flag.
+5. **Phase E** — add visualization, run both planners, verify before/after.
+
+Each phase should be testable independently. Phase A+B can be verified
+with a standalone script that creates the grid, runs VI, and shows the
+heatmap. Phase C+D add the integration. Phase E is polish.
+
+---
+
+## Key Parameters
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `cell_size` | 0.25 | 64x80 grid, fast VI, sufficient resolution |
+| `vi_tol` | 1e-3 | Convergence tolerance for Bellman updates |
+| `vi_max_iters` | 500 | Safety cap; should converge in ~200 |
+| `obstacle_inflation` | 0.15 | Half the inter-robot safety margin |
+| `move_cost_cardinal` | cell_size | Cost of N/S/E/W step |
+| `move_cost_diagonal` | cell_size * sqrt(2) | Cost of NE/SE/SW/NW step |
+
+---
+
+## Expected Behavior After Implementation
+
+Starting configuration: 5 robots clustered around (1, 4). Goal at (12, 3).
+Obstacle: merged triangle+rectangle spanning x in [1, 8], y in [-2, 15.66].
+
+**With `--planner greedy`** (before):
+- theta_star locks to 258.8 deg after iteration 1
+- Centroid stuck at (2.67, 7.57)
+- Never reaches goal
+
+**With `--planner vi`** (after):
+- theta_star at the starting position points ~south-southeast (toward the
+  gap below the triangle at y = -2)
+- As the centroid moves south past the triangle bottom, theta_star rotates
+  to east
+- As the centroid clears x = 8, theta_star rotates to north-northeast
+  toward (12, 3)
+- Swarm reaches goal within ~10-15 iterations
+
+The formation may need to shrink when passing through the narrow gap below
+the triangle (y between -3 and -2). The existing formation optimizer
+handles this automatically — it maximizes scale within the agreed free
+region, which will be small near the obstacle.
